@@ -1,0 +1,19 @@
+# 统一换行与编码策略，避免跨平台协作时文件被误改。
+# Windows 批处理必须是 CRLF —— cmd.exe 按 CRLF 切分命令行，
+# 纯 LF 会导致 if/for 括号块解析错乱（典型症状：命令被截断、报
+# "'t' is not recognized as an internal or external command"）。
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# 源码与文档统一 LF，避免无意义的整文件 diff
+*.py    text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+.gitignore     text eol=lf
+.gitattributes text eol=lf
+
+# Fock 内核是 wasm2js 产物（约 191 KB 单行压缩代码），
+# 标记为二进制既避免被换行转换破坏，也不让 diff 撑爆输出。
+lib/fock_glue.js binary
