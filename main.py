@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """QQ阅读（book.qq.com）小说爬虫 —— 纯协议还原，浏览器无关，右键直接运行。
 
-用法：直接运行，按提示输入关键词（回车用默认值），选择要下载的书即可。
-     非 TTY（管道/双击重定向）时自动使用默认值，保证无参可跑。
+用法：直接运行，按提示输入关键词，选择要下载的书即可。
+     未输入关键词时不会发起搜索，程序会提示后退出。
 
     python main.py
 
@@ -50,7 +50,6 @@ THREADS = 5                # 下载线程数
 SLEEP = 0.15               # 单章请求后限速秒数
 RETRIES = 3                # 单章重试次数
 RETRY_WAIT = 1.5           # 重试退避秒数
-DEFAULT_KEYWORD = ""    # 非交互运行时的默认搜索词
 FREE_CORPUS_MAX = 60       # 最多抓多少免费章当语言模型语料
 # ------------------------------------------
 
@@ -160,11 +159,15 @@ def _bootstrap() -> None:
 
 def search(client, keyword: str) -> tuple[dict, list[str]]:
     """搜索前 TOP_N 条，返回 ({小说名称:[], 小说作者名称:[], 小说链接:[]}, bids)。"""
+    keyword = keyword.strip()
+    if not keyword:
+        raise ValueError("搜索关键词不能为空")
     j = client.get_json("booksearch/query",
                         {"keyWord": keyword, "pageNo": 1, "pageSize": TOP_N})
     code = j.get("code")
     if code != 0:
-        raise RuntimeError(f"搜索失败 code={code}")
+        from qqread_vip import _api_error
+        raise _api_error("booksearch/query", j)
     book_list = (j.get("data") or {}).get("bookList") or []
     result = {"小说名称": [], "小说作者名称": [], "小说链接": []}
     bids: list[str] = []
@@ -390,7 +393,7 @@ def download_book(client, bid: str, title: str, max_chapters: int = 0) -> str:
         try:
             home = client.homepage()
         except Exception as e:  # noqa: BLE001
-            _log(f"  [会话] homepage 失败（按匿名处理）: {e}")
+            _log(f"  [会话] homepage 探测失败，继续尝试读取章节: {e}")
     nick = home.get("nickname")
     if nick:
         _log(f"  [会话] 已登录：{nick} memberType={home.get('memberType')} "
@@ -398,25 +401,27 @@ def download_book(client, bid: str, title: str, max_chapters: int = 0) -> str:
         if home.get("memberType") in (0, None) and vip_n:
             _log("  [会话] 注意：该账号当前没有有效会员（memberType=%s），VIP 章会读不到"
                  % home.get("memberType"))
+    elif client.cookies and home.get("code") == -4:
+        # homepage 与正文接口的鉴权口径不同：实测仅带 uid/fuid/usid 时
+        # homepage 仍可能返回 -4，但 detail/read 可以正常鉴权。只在探测
+        # 结果确为鉴权失败时提示，不擅自把有效 Cookie 判定为失效。
+        _log("  [会话] ⚠ homepage 鉴权失败，无法显示账号昵称/会员信息；"
+             "将继续尝试读取章节")
     elif client.cookies:
-        # 有 Cookie 却拿不到 nickname = 登录态已失效。必须显式警告：
-        # 否则会静默按匿名处理，用户只看到「只下前 N 章」却不知道原因。
-        _log("  [会话] ⚠ Cookie 已失效（homepage 未返回用户信息），将按匿名处理，"
-             "只能下免费章")
-        _log("  [会话] ⚠ 请重新在浏览器登录 book.qq.com，再更新凭据文件 "
-             "（位置见：python qqread_config.py）")
+        _log("  [会话] homepage 未返回用户信息，将继续尝试读取章节")
     else:
         _log("  [会话] 未配置 Cookie（匿名模式）")
 
-    if vip_n and nick:
+    can_try_vip = bool(client.cookies)
+    if vip_n and can_try_vip:
         try:
             corpus = prepare_corpus(client, chapters, bid, True, title=title)
             pipeline = VipPipeline(client, bid, corpus)
         except Exception as e:  # noqa: BLE001
             _log(f"  [VIP] 流水线初始化失败，VIP 章将无法解密: {e}")
             pipeline = None
-    elif vip_n:
-        _log(f"  [VIP] 共 {vip_n} 章付费/VIP，但当前无登录态 → 只能下前 {free_n} 章免费部分")
+    elif vip_n and not can_try_vip:
+        _log(f"  [VIP] 共 {vip_n} 章付费/VIP，当前未配置登录态 → 只能下免费部分")
 
     # 计划：先探测第一个非免费章的权限，静态决定下载范围。
     # 不能等线程跑到付费章才 stop —— 那会把还在排队的免费章一起丢掉（实测少 1 章）。
@@ -553,6 +558,19 @@ def _ask(prompt: str, default: str) -> str:
         return default
 
 
+def _ask_required(prompt: str) -> str:
+    """读取必填输入；支持管道传入，只有 EOF 或空白时返回空串。"""
+    while True:
+        try:
+            s = input(prompt).strip()
+        except EOFError:
+            _log(f"[非交互] {prompt} 未提供输入")
+            return ""
+        if s:
+            return s
+        _log("关键词不能为空，请重新输入。")
+
+
 def main() -> None:
     _bootstrap()
     from qqread_vip import Client, load_cookies
@@ -564,7 +582,9 @@ def main() -> None:
         _log("      VIP 章下载需先登录 book.qq.com 并配置凭据，方法见 README「使用方法」。")
         _log("      查看当前配置状态：python qqread_config.py")
 
-    keyword = _ask(f"请输入搜索关键词（回车默认 {DEFAULT_KEYWORD}）: ", DEFAULT_KEYWORD)
+    keyword = _ask_required("请输入搜索关键词: ")
+    if not keyword:
+        raise SystemExit("未提供搜索关键词，已取消搜索。")
     _log(f"搜索: {keyword} ...")
     result, bids = search(client, keyword)
     path = save_search_json(result)

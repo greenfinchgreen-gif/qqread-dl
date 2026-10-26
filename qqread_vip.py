@@ -72,6 +72,18 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def _api_error(path: str, j: dict) -> RuntimeError:
+    """把接口 code 转成可操作的异常，未知 code 保留原始响应。"""
+    code = j.get("code")
+    msg = j.get("msg") or j.get("message") or ""
+    if code == -4:
+        return RuntimeError(
+            f"{path} 登录态已失效（code=-4，{msg or '登录鉴权失败'}），"
+            "请重新登录 book.qq.com 并更新凭据文件")
+    detail = f"：{msg}" if msg else ""
+    return RuntimeError(f"{path} 失败 code={code}{detail}")
+
+
 # ---------------------------------------------------------------- 会话 Cookie
 
 
@@ -170,19 +182,27 @@ class Client:
     def detail(self, bid: str) -> dict:
         j = self.get_json("book/detail", {"bid": bid})
         if j.get("code") != 0:
-            raise RuntimeError(f"详情失败 code={j.get('code')}")
+            # 详情接口对匿名用户开放。登录 Cookie 失效时直接用会返回 -4，
+            # 导致免费章也下不了；这里仅在登录态下回退匿名查询，
+            # 不改变正文接口的权限判定。
+            if j.get("code") == -4 and self.cookies:
+                _log("  [会话] ⚠ 详情接口登录鉴权失败，改用匿名请求查询元数据")
+                anon = Client()
+                j = anon.get_json("book/detail", {"bid": bid})
+            if j.get("code") != 0:
+                raise _api_error("book/detail", j)
         return j.get("data") or {}
 
     def chapters(self, bid: str) -> list[dict]:
         j = self.get_json("book/detail/chapters", {"bid": bid})
         if j.get("code") != 0:
-            raise RuntimeError(f"目录失败 code={j.get('code')}")
+            raise _api_error("book/detail/chapters", j)
         return j.get("data") or []
 
     def read(self, bid: str, cid: int) -> dict:
         j = self.get_json("book/read", {"bid": bid, "cid": cid})
         if j.get("code") != 0:
-            raise RuntimeError(f"正文失败 code={j.get('code')}")
+            raise _api_error("book/read", j)
         return j.get("data") or {}
 
 

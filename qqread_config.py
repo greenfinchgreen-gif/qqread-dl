@@ -25,6 +25,11 @@
   A) {"cookie": "uid=...; fuid=...; usid=..."}            Cookie 串
   B) {"cookies": [{"name": "...", "value": "..."}, ...]}  Playwright storage_state
   C) {"uid": "...", "fuid": "...", ...}                   扁平字典
+
+【Playwright 格式的筛选规则】
+只保留 book.qq.com 登录所需的 uid/fuid/usid，并按 domain/path/expires
+过滤。浏览器 storage_state 常混入 Bing、百度等站点 Cookie；实测额外的
+QQ 统计/埋点字段也会让接口返回 code=-4「登陆鉴权失败」。
 """
 from __future__ import annotations
 
@@ -47,6 +52,12 @@ LEGACY_SESSION = os.path.join(HERE, "session_cookies.json")
 
 # 登录态必需的关键字段（用于判断凭据是否可用）
 KEY_FIELDS = ("uid", "fuid", "usid")
+
+# book.qq.com 的登录鉴权只需要这几个会话字段。浏览器导出的 Cookie 往往
+# 混有 Bing/百度等其它站点，以及同域的统计/埋点字段；实测把这些字段
+# 一起塞进请求头会让 book/detail、book/read 返回 code=-4「登陆鉴权失败」。
+# 仅保留登录必需字段，避免无关 Cookie 污染服务端鉴权。
+SITE_COOKIE_FIELDS = KEY_FIELDS
 
 # 凭据文件模板（首次运行会写出一份到凭据目录，不含任何真实值）
 CREDENTIAL_TEMPLATE = {
@@ -194,25 +205,60 @@ def parse_cookie_text(text: str) -> dict:
     return jar
 
 
+def _site_cookie_subset(jar: dict) -> dict:
+    """只保留 book.qq.com 登录必需字段，过滤混入的第三方 Cookie。"""
+    return {k: v for k, v in jar.items() if k in SITE_COOKIE_FIELDS}
+
+
 def parse_credentials(data: object) -> dict:
     """把三种格式的凭据数据统一成 {name: value} 字典。"""
     jar: dict[str, str] = {}
     if isinstance(data, dict):
         if isinstance(data.get("cookie"), str):
-            jar.update(parse_cookie_text(data["cookie"]))
+            jar.update(_site_cookie_subset(parse_cookie_text(data["cookie"])))
         elif isinstance(data.get("cookies"), list):
+            # Playwright storage_state 里包含全浏览器 Cookie（Bing、百度等）。
+            # 这里按 book.qq.com 适配：过滤域名/路径/过期时间，再按更具体的
+            # domain/path 覆盖同名项，只保留站点登录必需字段。
+            import time
+            now = time.time()
+            host = "book.qq.com"
+            candidates: list[tuple[int, int, dict]] = []
             for c in data["cookies"]:
-                if isinstance(c, dict) and c.get("name"):
-                    v = str(c.get("value", ""))
-                    if _cookie_safe(v):
-                        jar[str(c["name"])] = v
+                if not (isinstance(c, dict) and c.get("name")):
+                    continue
+                v = str(c.get("value", ""))
+                name = str(c["name"])
+                if name not in SITE_COOKIE_FIELDS or not _cookie_safe(v):
+                    continue
+                domain = str(c.get("domain") or "").lstrip(".").lower()
+                cpath = str(c.get("path") or "/")
+                expires = float(c.get("expires") or 0)
+                if expires > 0 and expires <= now:
+                    continue
+                if not domain or not (host == domain or host.endswith("." + domain)):
+                    continue
+                request_path = "/api/book/read"
+                if not (request_path == cpath
+                        or request_path.startswith(cpath.rstrip("/") + "/")):
+                    continue
+                candidates.append((len(domain), len(cpath), {
+                    "name": name,
+                    "value": v,
+                }))
+            # domain/path 越长越具体，后写覆盖先写，符合 RFC 6265 的匹配规则。
+            candidates.sort(key=lambda x: (x[0], x[1]))
+            for _, _, item in candidates:
+                jar[item["name"]] = item["value"]
         else:
             for k, v in data.items():
                 if k.startswith("_") or k == "origins":
                     continue          # 跳过模板里的说明字段
-                if isinstance(v, (str, int)) and _cookie_safe(str(v)):
-                    jar[str(k)] = str(v)
-    return jar
+                name = str(k)
+                if (isinstance(v, (str, int))
+                        and _cookie_safe(str(v))):
+                    jar[name] = str(v)
+    return _site_cookie_subset(jar)
 
 
 def _read_json(path: str) -> object | None:
